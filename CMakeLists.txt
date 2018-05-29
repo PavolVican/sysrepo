@@ -109,6 +109,12 @@ if((NOT AVL_FOUND) AND (NOT REDBLACK_FOUND))
     MESSAGE(WARNING "libavl or libredblack must be installed.")
 endif()
 
+# find OpenSSL library
+find_package(OpenSSL REQUIRED)
+
+# find curl library
+find_package(CURL)
+
 if(NOT DEFINED USE_AVL_LIB)
     # no preference configured, try to find libavl and then libredblack
     if(AVL_FOUND)
