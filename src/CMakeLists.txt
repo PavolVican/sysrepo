@@ -71,6 +71,9 @@ set(SYSREPO_ENGINE_SOURCES
     persistence_manager.c
     module_dependencies.c
     nacm.c
+    download_manager.c
+    verify_manager.c
+    restconf_client.c
 )
 
 add_library(COMMON OBJECT ${COMMON_SOURCES})
