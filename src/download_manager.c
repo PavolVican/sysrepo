@@ -10,11 +10,22 @@
 #include <netdb.h>
 #include <curl/curl.h>
 #include <unistd.h>
+#include <string.h>
+#include <stdio.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/utsname.h>
+#include <fcntl.h>
+
 #include "zerotouch.h"
 
 
 #define CHECK_RC_RETURN(RC) if (RC != SR_ERR_OK) { return rc; }
+#define CHECK_RC_LABEL(RC, LABEL) if (RC != EXIT_SUCCESS) { goto LABEL; }
 #define SR_STORED_KEYS_DIR "/etc/sysrepo/KEY_STORE/"
+#define BUFFER_MAX 512
+#define BOOTSTRAP_LOG(CONNECTION, TYPE, MSG) do { if (CONNECTION != NULL) { /* call restconf rpc report progress */ } } while 0;
 
 struct boostrap_server {
     char *ip;
@@ -344,15 +355,18 @@ cleanup:
 }
 
 int
-dwn_apply_config_data(struct zt_ctx *ctx, struct lyd_node *root)
+dwn_apply_config_data(struct zt_ctx *ctx, const char *data, int replace)
 {
     dm_data_info_t *info;
-    struct lyd_node *node, *iter, *next = NULL;
+    struct lyd_node *root, *node, *iter, *next = NULL;
     const char *name;
 
-    CHECK_NULL_ARG2(ctx, root);
+    root = lyd_parse_mem(ctx->ly_ctx, data, LYD_XML, LYD_OPT_CONFIG);
+    if (!root) {
+        SR_LOG_DBG_MSG("Not valid configuration data");
+        return EXIT_FAILURE;
+    }
 
-    node = root;
     SR_LOG_DBG_MSG("Apply bootstrap config data");
     do {
         name = root->schema->module->name;
@@ -371,13 +385,23 @@ dwn_apply_config_data(struct zt_ctx *ctx, struct lyd_node *root)
         }
 
         dm_get_data_info(ctx->dm_ctx, ctx->session_ctx, name, &info);
+        if (replace == TRUE) {
+            info->node = root;
+        } else {
+            if (node != NULL) {
+                lyd_merge(info->node, root, LYD_OPT_DESTRUCT | LYD_OPT_EXPLICIT);
+            } else {
+                info->node = root;
+            }
+        }
+
         info->node = root;
         info->modified = true;
         SR_LOG_DBG("Module: %s was modified", name);
         root = node;
     } while (node != NULL);
 
-    return SR_ERR_OK;
+    return EXIT_SUCCESS;
 }
 
 /* return value
@@ -401,7 +425,7 @@ dwn_parse_redirect(struct zt_ctx *ctx, struct lyd_node *root, X509_STORE *store_
 
 
     /* node is list of bootstrap servers */
-    for(node = root->child; node; node = node->next) {
+    for(node = root; node; node = node->next) {
         trust_anchor = NULL;
         cert = NULL;
 
@@ -463,6 +487,164 @@ dwn_parse_redirect(struct zt_ctx *ctx, struct lyd_node *root, X509_STORE *store_
     return 1;
 }
 
+int
+dwn_run_script(const char *script, int pre_script, CURL *connection)
+{
+    FILE *fp;
+    int status, fd, count = 0, length, total = BUFFER_MAX, position = 0;
+    char buffer[BUFFER_MAX], *message = NULL, *tmp, exit_code, rc = EXIT_FAILURE;
+
+    if (!script) {
+        return EXIT_SUCCESS;
+    }
+
+    /* create tmp file for storing script */
+    fd = open("/tmp/script", O_RDWR|O_CREAT, 0700);
+    if (fd == -1) {
+        SR_LOG_DBG_MSG("Failed create file for running script");
+        return EXIT_FAILURE;
+    }
+
+    write(fd, script, strlen(script));
+    close(fd);
+
+    message = malloc(BUFFER_MAX);
+    if (!message) {
+        SR_LOG_ERR("Unable to allocate memory in %s", __func__);
+        return EXIT_FAILURE;
+    }
+
+    /* open pipe of script*/
+    fp = popen("/tmp/script", "r");
+    if (fp == NULL) {
+        SR_LOG_DBG_MSG("Failed connect to pipe of running script");
+        goto cleanup;
+    }
+
+    /* read from pipe */
+    while (fgets(buffer, BUFFER_MAX, fp) != NULL) {
+        length = strlen(buffer);
+        count += length;
+        if (count >= BUFFER_MAX) {
+            total += BUFFER_MAX;
+            count -= BUFFER_MAX;
+            tmp = realloc(message, total);
+            if (!tmp) {
+                SR_LOG_ERR("Unable to allocate memory in %s", __func__);
+                pclose(fp);
+                goto cleanup;
+            }
+            message = tmp;
+        }
+        memcpy(message + position, buffer, length);
+        position += length;
+    }
+    message[position] = '\0';
+
+    status = pclose(fp);
+    if (status == -1) {
+        SR_LOG_DBG_MSG("Failed disconnect from pipe of running script");
+        goto cleanup;
+    } else {
+        exit_code = (char)WEXITSTATUS(status);
+        if (exit_code < 0) {
+            /* call restconf server */
+        } else {
+            rc = EXIT_SUCCESS;
+            if (exit_code > 0) {
+                /* call restconf server */
+            }
+        }
+    }
+
+cleanup:
+    free(message);
+    return rc;
+}
+
+int
+dwn_update_os_plugin(const char **array_uri, const char **array_hash, const char **array_hash_value)
+{
+    return EXIT_SUCCESS;
+}
+
+int
+dwn_check_boot_image(struct lyd_node *root)
+{
+    const char *os = NULL, *version = NULL;
+    const char **array_uri = NULL, **array_hash, **array_hash_value;
+    struct lyd_node *iter;
+    struct lyd_node_leaf_list *leaf;
+    struct utsname data;
+    struct ly_set *uri = NULL, *hash = NULL;
+    int rc = EXIT_FAILURE, i;
+
+
+    if (!root) {
+        return EXIT_SUCCESS;
+    }
+
+    LY_TREE_FOR(root, iter) {
+        if (!strcmp(iter->schema->name, "os-name")) {
+            os = ((struct lyd_node_leaf_list *)iter)->value_str;
+        } else if (!strcmp(iter->schema->name, "os-version")) {
+            version = ((struct lyd_node_leaf_list *)iter)->value_str;
+        }
+    }
+
+    if (os == NULL && version == NULL) {
+        return EXIT_SUCCESS;
+    }
+
+    uname(&data);
+    if ((os && strcmp(data.sysname, os) != 0) || (version && strcmp(data.version, version) != 0)) {
+        uri = lyd_find_path(root, "/ietf-zerotouch-information:#zerotouch-information/onboarding-information/download-uri");
+        hash = lyd_find_path(root, "/ietf-zerotouch-information:#zerotouch-information/onboarding-information/image-verification");
+
+        if (uri->number != hash->number) {
+            SR_LOG_DBG_MSG("Invalid information about downloading boot image");
+            goto error;
+        }
+
+        array_uri = malloc(3 * uri->number);
+        if (!array_uri) {
+            SR_LOG_ERR("Unable to allocate memory in %s", __func__);
+            goto error;
+        }
+
+        array_hash = &array_uri[uri->number];
+        array_hash_value = &array_uri[2 * uri->number];
+
+        for(i = 0; i < uri->number; ++i) {
+            array_uri[i] = ((struct lyd_node_leaf_list *)uri->set.d[i])->value_str;
+        }
+
+        for(i = 0; i < hash->number; ++i) {
+            leaf = (struct lyd_node_leaf_list *)uri->set.d[i];
+            if (strcmp(leaf->schema->name, "hash-algorithm") == 0) {
+                array_hash[i] = leaf->value_str;
+                array_hash_value[i] = ((struct lyd_node_leaf_list *)leaf->next)->value_str;
+            } else {
+                array_hash_value[i] = leaf->value_str;
+                array_hash[i] = ((struct lyd_node_leaf_list *)leaf->next)->value_str;
+            }
+        }
+
+        rc = dwn_update_os_plugin(array_uri, array_hash, array_hash_value);
+        if (rc == EXIT_FAILURE) {
+            goto error;
+        }
+    }
+
+    rc = EXIT_SUCCESS;
+
+error:
+    free((void *)array_uri);
+    ly_set_free(uri);
+    ly_set_free(hash);
+    return rc;
+}
+
 /* return value
  * 0 - OK
  * 1 - ERROR
@@ -470,13 +652,13 @@ dwn_parse_redirect(struct zt_ctx *ctx, struct lyd_node *root, X509_STORE *store_
 int
 dwn_parse_configuration(struct zt_ctx *ctx, struct lyd_node *root)
 {
-    struct lyd_node *node, *image;
+    struct lyd_node *node, *image = NULL;
     struct lyd_node_leaf_list *leaf;
-    int replace_conf = TRUE, rc = 0;
+    int replace_conf = TRUE, rc;
     char *pre_script = NULL, *post_script = NULL, *data = NULL;
 
 
-    for (node = root->child; node; node = node->next) {
+    for (node = root; node; node = node->next) {
         if (!strcmp(node->schema->name, "boot-image")) {
             image = node->child;
         } else if (!strcmp(node->schema->name, "configuration-handling")) {
@@ -496,10 +678,25 @@ dwn_parse_configuration(struct zt_ctx *ctx, struct lyd_node *root)
     }
 
     /* check boot-image */
+    rc = dwn_check_boot_image(image);
+    if (rc == EXIT_FAILURE) {
+        goto cleanup;
+    }
 
     /* run pre-configuration-script */
+    rc = dwn_run_script(pre_script, TRUE, ctx->rc_connection);
+    if (rc == EXIT_FAILURE) {
+        goto cleanup;
+    }
+
+    /* apply configuration data */
+    rc = dwn_apply_config_data(ctx, data, replace_conf);
+    if (rc == EXIT_FAILURE) {
+        goto cleanup;
+    }
 
     /* run post-configuration-script */
+    rc = dwn_run_script(post_script, FALSE, ctx->rc_connection);
 
 cleanup:
     free(pre_script);
@@ -535,19 +732,14 @@ dwn_parse_bootstrap_data(struct zt_ctx *ctx, struct bootstrap_data *bootstrap, X
             curl_easy_cleanup(ctx->rc_connection);
         }
 
-        rc = dwn_parse_redirect(ctx, root, store_voucher, trust_state);
+        rc = dwn_parse_redirect(ctx, root->child, store_voucher, trust_state);
     } else {
         if (!trust_state) {
             goto cleanup;
         }
 
-        /*
-         * struct lyd_node *node;
-            node = lyd_parse_path(tmp_ctx->ctx, "/home/xvican01/test.xml", LYD_XML, LYD_OPT_CONFIG);
-         * lyd_parse_mem(ctx, "", LYD_XML, LYD_OPT_CONFIG);
-         * apply_config_data(ctx, dm_session, node);
-         * */
-        }
+        rc = dwn_parse_configuration(ctx, root->child);
+    }
 
 cleanup:
     lyd_free(root);
