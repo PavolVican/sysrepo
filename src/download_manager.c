@@ -17,15 +17,17 @@
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <fcntl.h>
+#include <dlfcn.h>
 
 #include "zerotouch.h"
 
 
 #define CHECK_RC_RETURN(RC) if (RC != SR_ERR_OK) { return rc; }
-#define CHECK_RC_LABEL(RC, LABEL) if (RC != EXIT_SUCCESS) { goto LABEL; }
 #define SR_STORED_KEYS_DIR "/etc/sysrepo/KEY_STORE/"
 #define BUFFER_MAX 512
 #define BOOTSTRAP_LOG(CONNECTION, TYPE, MSG) do { if (CONNECTION != NULL) { /* call restconf rpc report progress */ } } while 0;
+
+typedef int (*zt_update_clb)(const char **array_uri, const char **array_hash, const char **array_hash_value);
 
 struct boostrap_server {
     char *ip;
@@ -216,7 +218,7 @@ dwn_load_certificates(dm_data_info_t *key_store, X509_STORE **voucher, EVP_PKEY 
     CHECK_NULL_NOMEM_RETURN((*tls_certs)->learned_certs);
 
     rc = dwn_load_voucher_certs(key_store, *voucher);
-    //CHECK_RC_RETURN(rc);
+    CHECK_RC_RETURN(rc);
 
     rc = dwn_load_bootstrap_certs(key_store, (*tls_certs)->configure_certs);
     CHECK_RC_RETURN(rc);
@@ -565,7 +567,47 @@ cleanup:
 int
 dwn_update_os_plugin(const char **array_uri, const char **array_hash, const char **array_hash_value)
 {
-    return EXIT_SUCCESS;
+    char plugins_dir[PATH_MAX + 1] = { 0, };
+    char plugin_filename[PATH_MAX + 1] = { 0, };
+    char *env_str = NULL;
+    void *dl_handle;
+    int rc;
+    zt_update_clb update_cb;
+
+    /* get plugins dir from environment variable, or use default one */
+    env_str = getenv("SR_PLUGINS_DIR");
+    if (NULL != env_str) {
+        strncat(plugins_dir, env_str, PATH_MAX);
+    } else {
+        strncat(plugins_dir, SR_PLUGINS_DIR, PATH_MAX);
+    }
+
+    SR_LOG_DBG("Loading update plugin from '%s'.", plugins_dir);
+    snprintf(plugin_filename, PATH_MAX, "%s/zerotouch_update.so", plugins_dir);
+
+    /* open the dynamic library with plugin */
+    dl_handle = dlopen(plugin_filename, RTLD_LAZY);
+    if (NULL == dl_handle) {
+        SR_LOG_WRN("Unable to load the plugin: %s.", dlerror());
+        rc = EXIT_FAILURE;
+        goto cleanup;
+    }
+
+    /* get init function pointer */
+    *(void **) (&update_cb) = dlsym(dl_handle, "zerotouch-update");
+    if (NULL == update_cb) {
+        SR_LOG_WRN("Unable to find 'zerotouch-update' function: %s.", dlerror());
+        rc = EXIT_FAILURE;
+        goto cleanup;
+    }
+
+    rc = update_cb(array_uri, array_hash, array_hash_value);
+
+cleanup:
+    if (NULL != dl_handle) {
+        dlclose(dl_handle);
+    }
+    return rc;
 }
 
 int
@@ -720,7 +762,7 @@ dwn_parse_bootstrap_data(struct zt_ctx *ctx, struct bootstrap_data *bootstrap, X
     root = lyd_parse_mem(ctx->ly_ctx, data, (is_xml) ? LYD_XML : LYD_JSON, LYD_OPT_DATA_TEMPLATE , "zerotouch-information");
 
     if (!root) {
-        return 1;
+        return rc;
     }
 
     if (sign) {

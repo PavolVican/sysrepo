@@ -107,7 +107,7 @@ add_library(sysrepo_a $<TARGET_OBJECTS:COMMON> $<TARGET_OBJECTS:SR_ENGINE> $<TAR
 SET_TARGET_PROPERTIES(sysrepo_a PROPERTIES
               OUTPUT_NAME sysrepo CLEAN_DIRECT_OUTPUT 1)
 target_link_libraries(sysrepo ${LINK_LIBRARIES})
-target_link_libraries(sysrepo_a ${LINK_LIBRARIES})
+target_link_libraries(sysrepo_a ${LINK_LIBRARIES} dl)
 
 # sysrepo daemon
 add_executable(sysrepod ${EXECUTABLES_DIR}/sysrepod.c)
